@@ -248,6 +248,11 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.context_pack import (
+    ContextPack,
+    ContextPackDelta,
+    ContextPackError,
+)
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -827,6 +832,33 @@ class ScopedContextApplication:
     def __init__(self, runtime: BuiltinRuntime, scope_id: str) -> None:
         self._runtime = runtime
         self.scope_id = validate_scope_id(scope_id)
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        *,
+        base_pack: ContextPack | None = None,
+    ) -> ContextPack | ContextPackDelta:
+        """Prepare the target context, returning a full pack or an incremental delta.
+
+        When no ``base_pack`` is supplied the complete target is returned as a full
+        ``ContextPack``. When a valid base pack is supplied the result is a
+        ``ContextPackDelta`` that, applied to the base, reconstructs the same target
+        body the ordinary ``prepare`` would have produced.
+        """
+
+        prepared = await self.prepare(request)
+        target = (
+            ContextPack.build(())
+            if prepared.content is None
+            else ContextPack.from_content(prepared.content)
+        )
+        if base_pack is None:
+            return target
+        if not isinstance(base_pack, ContextPack):
+            raise ContextPackError("base_pack must be a ContextPack")  # noqa: TRY003
+        return ContextPackDelta.between(base_pack, target)
 
     async def prepare(
         self,
