@@ -25,6 +25,14 @@ from powercontext.builtin.sources.content import (
     ContentSourceTarget,
     ContentTextEvidenceProjection,
 )
+from powercontext.sources.csv_rows import (
+    CSV_ROW_SOURCE_DEFINITION,
+    CSVDocumentInput,
+    CSVRowInput,
+    CSVRowSource,
+    csv_row_source_id,
+    parse_csv_document,
+)
 from powercontext.builtin.sources.external_skill import (
     EXTERNAL_SKILL_SNAPSHOT_SOURCE_ADAPTER,
     EXTERNAL_SKILL_SNAPSHOT_SOURCE_DEFINITION,
@@ -70,6 +78,10 @@ BUILTIN_SOURCE_REGISTRY = SourceDefinitionRegistry((
 
 __all__ = [
     "BUILTIN_SOURCE_REGISTRY",
+    "CSV_ROW_SOURCE_DEFINITION",
+    "CSVDocumentInput",
+    "CSVRowInput",
+    "CSVRowSource",
     "CONTENT_SOURCE_ADAPTER",
     "CONTENT_SOURCE_DEFINITION",
     "CONTENT_SOURCE_NAME",
@@ -90,6 +102,8 @@ __all__ = [
     "ContentSourceTarget",
     "ContentTextEvidenceProjection",
     "ExternalSkillImportMode",
+    "csv_row_source_id",
+    "parse_csv_document",
     "ExternalSkillSnapshotCapture",
     "ExternalSkillSnapshotSource",
     "ExternalSkillSnapshotSourceAdapter",
