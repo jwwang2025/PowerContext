@@ -97,6 +97,7 @@ from powercontext.builtin.persistence.processing_migration import (
     bootstrap_processing_schema,
 )
 from powercontext.builtin.persistence.scope_search_schema import ensure_scope_search_schema
+from powercontext.builtin.persistence.seekdb.memory_index import SeekDBHybridMemoryIndex
 from powercontext.builtin.persistence.seekdb.profile import SeekDBConfig, SeekDBProfile
 from powercontext.builtin.persistence.skill_distribution_schema import ensure_skill_distribution_schema
 from powercontext.builtin.persistence.sqlite.experience_index import SQLiteExperienceFTSIndex
@@ -1008,10 +1009,17 @@ async def open_builtin_contexts(
                 await contexts.aclose_usage_recorder()
         return
     experience_index = OceanBaseExperienceFTSIndex()
-    indexes = [OceanBaseMemoryFTSIndex()]
-    if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-    index = CompositeMemoryIndex(*indexes)
+    fts_index = OceanBaseMemoryFTSIndex()
+    vector_index = OceanBaseMemoryVectorIndex(embedding_model.profile) if embedding_model is not None else None
+    if isinstance(database, SeekDBConfig) and vector_index is not None:
+        # seekdb answers the full-text and the vector candidates with one
+        # native statement, so the hybrid mode no longer needs two queries.
+        index = CompositeMemoryIndex(SeekDBHybridMemoryIndex(fts_index, vector_index))
+    else:
+        index = CompositeMemoryIndex(
+            fts_index,
+            *(() if vector_index is None else (vector_index,)),
+        )
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))
