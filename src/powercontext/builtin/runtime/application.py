@@ -254,6 +254,7 @@ from powercontext.builtin.runtime.context_pack import (
     ContextPackError,
 )
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
+from powercontext.builtin.runtime.source_count import SourceCountAdmission
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
 from powercontext.builtin.sources import (
@@ -493,6 +494,7 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
+            await self._runtime._request_counted_processing(self.scope_id)
             return SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
@@ -509,7 +511,9 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
-            return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
+            receipt = SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
+        await self._runtime._request_counted_processing(self.scope_id)
+        return receipt
 
 
 class SourceApplication:
@@ -568,7 +572,11 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        # A lineage-only Artifact still publishes one journal identity, so it
+        # counts toward the automatic admission of every waiting Family.
+        await self._runtime._request_counted_processing(self.scope_id)
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -3059,6 +3067,7 @@ class BuiltinRuntime:
         remote_ingestion: RemoteIngestion | None = None,
         dream_service: DreamService | None = None,
         generation_concurrency: int = 4,
+        source_count_admissions: tuple[SourceCountAdmission, ...] = (),
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
@@ -3117,6 +3126,7 @@ class BuiltinRuntime:
         self.source_window_limit = source_window_limit
         self.context_assembly_max_entries = context_assembly_max_entries
         self.recall_sufficiency_policy = recall_sufficiency_policy
+        self._source_count_admissions = source_count_admissions
         self._scope_cache = ScopeCache(
             scope_cache_size,
             evictor=scope_evictor,
@@ -3413,6 +3423,49 @@ class BuiltinRuntime:
 
     def _lock(self, scope_id: str) -> asyncio.Lock:
         return self._scope_cache.lock(validate_scope_id(scope_id))
+
+    async def _request_counted_processing(self, scope_id: str) -> None:
+        """Start one automatic window per Family whose pending count reached its threshold.
+
+        The count is read from durable journal state, so a replayed identity,
+        a repeated capture, and a restarted Runtime all observe the same
+        number. A failure here never disturbs the write that published the
+        new identity; the Family keeps waiting for its next admission.
+        """
+
+        if not self._source_count_admissions or self.artifact_processing_supervisor is None:
+            return
+        for admission in self._source_count_admissions:
+            try:
+                accepted = await admission.request(scope_id)
+            except Exception as error:
+                log_safely(
+                    logger,
+                    logging.WARNING,
+                    "Source count admission failed",
+                    exc_info=error,
+                    extra={
+                        "event": "source_count.admission_failed",
+                        "outcome": "failure",
+                        "binding": admission.binding_name,
+                    },
+                )
+                continue
+            if accepted:
+                try:
+                    self.artifact_processing_supervisor.wake(admission.binding_name)
+                except Exception as error:
+                    log_safely(
+                        logger,
+                        logging.WARNING,
+                        "Artifact processing wake failed after count admission",
+                        exc_info=error,
+                        extra={
+                            "event": "source_count.wake_failed",
+                            "outcome": "accepted",
+                            "binding": admission.binding_name,
+                        },
+                    )
 
     @asynccontextmanager
     async def _locked(self, scope_id: str) -> AsyncIterator[None]:

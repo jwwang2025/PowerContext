@@ -156,6 +156,7 @@ from powercontext.builtin.runtime.readiness import (
 )
 from powercontext.builtin.runtime.recall_sufficiency import RecallSufficiencyPolicy
 from powercontext.builtin.runtime.relational import RelationalContexts
+from powercontext.builtin.runtime.source_count import SourceCountAdmission
 from powercontext.builtin.runtime.topic_memory_processing import (
     TopicMemoryWorkerSpec,
     run_topic_memory_worker,
@@ -165,6 +166,7 @@ from powercontext.builtin.sources import (
     BUILTIN_SOURCE_REGISTRY,
     TEXT_EVIDENCE_PROJECTION_KEY,
 )
+from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
 from powercontext.errors import InvalidSourceProjectionError, SourceProjectionNotFoundError
 from powercontext.sources import Source, SourceDefinitionRegistry, SourceProjectionKey
 
@@ -651,6 +653,7 @@ async def open_builtin_runtime(
                 scheduled_source_runner=scheduled_source_runner,
                 scheduled_experience_runner=scheduled_experience_runner,
                 remote_ingestion=contexts,
+                source_count_admissions=_source_count_admissions(config, contexts, processing_bindings),
             )
         )
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
@@ -811,6 +814,44 @@ def _topic_memory_processing_available(
     )
 
 
+def _source_count_thresholds(config: BuiltinConfig) -> dict[str, int]:
+    """Map each count-admitted Family binding to its configured threshold."""
+
+    thresholds = {
+        SOURCE_WINDOW_TRIGGER_NAME: config.runtime.memory_source_count_threshold,
+        TOPIC_MEMORY_SOURCE_WINDOW_BINDING: config.runtime.topic_memory_source_count_threshold,
+    }
+    return {binding: threshold for binding, threshold in thresholds.items() if threshold is not None}
+
+
+def _source_count_admissions(
+    config: BuiltinConfig,
+    contexts: RelationalContexts,
+    bindings: Sequence[ArtifactProcessingBinding],
+) -> tuple[SourceCountAdmission, ...]:
+    """Admit one automatic window per Family that owns a count threshold.
+
+    A Family without a registered binding owns no automatic window, so it
+    never asks the Supervisor for one.
+    """
+
+    registered = {binding.binding_name for binding in bindings}
+    requesters = {
+        SOURCE_WINDOW_TRIGGER_NAME: contexts.request_memory_processing,
+        TOPIC_MEMORY_SOURCE_WINDOW_BINDING: contexts.request_topic_memory_flush,
+    }
+    return tuple(
+        SourceCountAdmission(
+            database=contexts.database,
+            binding_name=binding_name,
+            threshold=threshold,
+            request_processing=requesters[binding_name],
+        )
+        for binding_name, threshold in _source_count_thresholds(config).items()
+        if binding_name in registered
+    )
+
+
 def _topic_memory_provider_available(config: BuiltinConfig) -> bool:
     try:
         validate_topic_memory_provider_settings(config.inference)
@@ -950,6 +991,7 @@ async def open_builtin_contexts(
                 source_registry=source_registry,
                 cursor_secret=cursor_secret,
                 tracing=tracing,
+                source_count_thresholds=_source_count_thresholds(config),
             )
             try:
                 await contexts.scopes.bootstrap_default()
@@ -1027,6 +1069,7 @@ async def open_builtin_contexts(
             source_registry=source_registry,
             cursor_secret=cursor_secret,
             tracing=tracing,
+            source_count_thresholds=_source_count_thresholds(config),
         )
         try:
             await contexts.scopes.bootstrap_default()

@@ -202,6 +202,11 @@ class RuntimeConfig(BaseModel):
     schedule_seconds: float | None = Field(default=None, gt=0)
     memory_schedule_seconds: float | None = Field(default=None, gt=0)
     experience_schedule_seconds: float | None = Field(default=None, gt=0)
+    # Count admission: start a Family's processing once this many new Source
+    # identities wait behind its last successful cursor. None keeps the
+    # time-only behavior.
+    memory_source_count_threshold: int | None = None
+    topic_memory_source_count_threshold: int | None = None
     dream_enabled: bool = True
     dream_max_pending_per_scope: int = Field(default=32, ge=1, le=1000)
     generation_concurrency: int = Field(default=4, ge=1, le=64)
@@ -229,6 +234,27 @@ class RuntimeConfig(BaseModel):
     model_usage_queue_capacity: int = Field(default=256, ge=1, le=16_384)
     model_usage_write_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
     model_usage_flush_timeout_seconds: float = Field(default=0.5, gt=0, le=30)
+
+    @field_validator(
+        "memory_source_count_threshold",
+        "topic_memory_source_count_threshold",
+        mode="before",
+    )
+    @classmethod
+    def validate_source_count_threshold(cls, value: Any) -> Any:
+        """Accept only a strict positive integer or an explicit opt-out.
+
+        Booleans, strings, floats, zero, and negative values are rejected so
+        that a threshold never changes meaning through a lossy conversion.
+        """
+
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("source count threshold must be a positive integer or None")  # noqa: TRY003
+        if value < 1:
+            raise ValueError("source count threshold must be a positive integer")  # noqa: TRY003
+        return value
 
     @model_validator(mode="after")
     def validate_topic_memory_history_candidates(self) -> RuntimeConfig:

@@ -317,6 +317,9 @@ class _ScopedServices:
     prompts: PromptService
     generation_receipts: HandoffGenerationReceipts
     model_usage: _ModelUsageRecorder
+    # Optional count admission: the number of pending Source identities that
+    # starts this Scope's next automatic window.
+    source_count_threshold: int | None = None
 
     def generation_sources(self) -> GenerationSourceAccess:
         return GenerationSourceAccess(self.repositories.sources)
@@ -547,8 +550,10 @@ class RelationalContexts:
         model_usage_queue_capacity: int = 256,
         model_usage_write_timeout_seconds: float = 1.0,
         model_usage_flush_timeout_seconds: float = 0.5,
+        source_count_thresholds: Mapping[str, int] | None = None,
     ) -> None:
         self.database = database
+        self._source_count_thresholds = dict(source_count_thresholds or {})
         self.scopes = ScopeApplication(database, cursor_secret=cursor_secret)
         self.source_registry = source_registry or BUILTIN_SOURCE_REGISTRY
         self.index = NoMemoryIndex() if index is None else index
@@ -951,6 +956,19 @@ class RelationalContexts:
                     connection, scope, TOPIC_MEMORY_SOURCE_WINDOW_BINDING
                 )
         return pending is not None
+
+    async def request_memory_processing(self, scope_id: str, /) -> bool:
+        """Accept one automatic Memory window and return only after it commits.
+
+        The Memory Family reads its own Source window, so a durable request is
+        all that admission needs. A restarted Runtime discovers the same
+        request and retries the window that never succeeded.
+        """
+
+        scope = validate_scope_id(scope_id)
+        async with self.database.transaction() as connection:
+            await ArtifactProcessingIntentRepository().request(connection, scope, SOURCE_WINDOW_TRIGGER_NAME)
+        return True
 
     async def browse_topic_memories(
         self,
@@ -1451,6 +1469,7 @@ class RelationalContexts:
             token_estimator=self._token_estimator,
             source_registry=self.source_registry,
             model_usage=self._model_usage,
+            source_count_threshold=self._source_count_thresholds.get(SOURCE_WINDOW_TRIGGER_NAME),
         )
 
 
@@ -1750,6 +1769,8 @@ class _RelationalTriggers:
                         await on_commit(connection, before, updated)
                     if processing is not None:
                         await processing.complete(connection, remaining_work=action.through < high_watermark)
+            if processing is not None:
+                await self._request_continued_window(action.through, high_watermark)
             return MemoryFlushResult(
                 previous_cursor=action.after,
                 high_watermark=high_watermark,
@@ -1758,6 +1779,24 @@ class _RelationalTriggers:
                 memory_ref=None if updated is None else updated.as_ref(),
                 held_count=1 if held else 0,
                 hold_codes=_hold_codes(prepared),
+            )
+
+    async def _request_continued_window(self, cursor: int, high_watermark: int) -> None:
+        """Re-judge the remaining count after one successful window.
+
+        Reaching the threshold once never drains the whole backlog. The next
+        automatic window starts only while the identities left after the new
+        cursor still satisfy the same count condition.
+        """
+
+        threshold = self._services.source_count_threshold
+        if threshold is None or high_watermark - cursor < threshold:
+            return
+        async with self._services.database.transaction() as connection:
+            await ArtifactProcessingIntentRepository().request(
+                connection,
+                self._services.scope_id,
+                SOURCE_WINDOW_TRIGGER_NAME,
             )
 
     async def _sources(
