@@ -92,6 +92,7 @@ from powercontext.builtin.artifacts.memory.protocols import (
     MemoryWriteRejectionCode,
     MemoryWriteVerdict,
 )
+from powercontext.builtin.artifacts.memory.http_reranker import HTTPMemoryReranker
 from powercontext.builtin.artifacts.memory.reranking import (
     MEMORY_RERANK_INSTRUCTIONS,
     MEMORY_RERANK_INSTRUCTIONS_VERSION,
@@ -116,6 +117,7 @@ __all__ = [
     "CapabilityNotSupportedError",
     "DefaultMemoryEvidenceProjector",
     "EmbeddingProfile",
+    "HTTPMemoryReranker",
     "InvalidEmbeddingError",
     "InvalidMemoryCandidateError",
     "InvalidMemoryCitationError",
