@@ -255,6 +255,10 @@ from powercontext.builtin.runtime.context_pack import (
 )
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.runtime.source_count import SourceCountAdmission
+from powercontext.builtin.runtime.source_lifecycle import (
+    SourceLifecycleApplication,
+    SourceLifecycleServices,
+)
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
 from powercontext.builtin.sources import (
@@ -328,6 +332,7 @@ class TopicMemorySearch(Protocol):
 TopicMemoryGet = Callable[[str, ArtifactRef], Awaitable[PublishedTopicMemory]]
 TopicMemoryBrowse = Callable[..., Awaitable[tuple[TopicMemoryCurrentItem, ...]]]
 TopicMemoryFlush = Callable[[str], Awaitable[bool]]
+TopicMemoryExclusions = Callable[[str], Awaitable[frozenset[str]]]
 TopicMemorySearchObserver = Callable[[str, bool], None]
 
 logger = logging.getLogger(__name__)
@@ -2609,6 +2614,61 @@ class ScopedMemoryApplication:
                 entry=_entry_record(updated, retired),
             )
 
+    async def set_entry_states(
+        self,
+        *,
+        deactivate: Sequence[str] = (),
+        activate: Sequence[str] = (),
+        reason: str | None = None,
+    ) -> MemoryMutationResult | None:
+        """Move logical entries between the active and the inactive state.
+
+        The body version of every entry stays exactly as it was; only its
+        eligibility for search and Context changes. Entries that already hold
+        the target state are skipped, so a repeated call does not create a new
+        Memory Revision.
+        """
+
+        if not deactivate and not activate:
+            return None
+        async with self._runtime._context(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+        ) as context:
+            service = context.artifacts.memory
+            current = await _head_or_none(service, context.artifacts.memory_artifact_id)
+            if current is None:
+                return None
+            entries = {item.entry_id: item for item in await service.entries(current)}
+            states = {item.entry_id: item.state for item in current.content.manifest.entries}
+            retired: list[MemoryEntryVersion] = []
+            for entry_id in deactivate:
+                item = entries.get(entry_id)
+                if item is None:
+                    raise MemoryEntryNotFoundError(entry_id)
+                if states.get(entry_id) != "inactive":
+                    retired.append(item)
+            restored: list[MemoryEntryVersion] = []
+            for entry_id in activate:
+                item = entries.get(entry_id)
+                if item is None:
+                    raise MemoryEntryNotFoundError(entry_id)
+                if states.get(entry_id) != "active":
+                    restored.append(item)
+            if not retired and not restored:
+                return None
+            async with self._runtime._locked(self.scope_id):
+                updated = current
+                if retired:
+                    updated = await service.forget(updated, entries=tuple(retired), reason=reason)
+                if restored:
+                    updated = await service.reactivate(updated, entries=tuple(restored), reason=reason)
+            return MemoryMutationResult(
+                previous_revision=current.revision,
+                memory_ref=updated.as_ref(),
+                entry=None,
+            )
+
     async def changes(self, *, since_revision: int | None = None) -> MemoryChangesPage:
         async with self._runtime._context(self.scope_id) as context:
             service = context.artifacts.memory
@@ -2708,6 +2768,15 @@ class ScopedTopicMemoryApplication:
                     embedding_timeout_seconds,
                 )
         observer = self._runtime._topic_memory_search_observer
+        excluded = await self._excluded_topics()
+        if excluded:
+            result = result.model_copy(
+                update={
+                    "hits": tuple(
+                        hit for hit in result.hits if hit.artifact_ref.artifact_id not in excluded
+                    )
+                }
+            )
         if observer is not None:
             try:
                 observer(result.mode, used_fallback)
@@ -2796,6 +2865,14 @@ class ScopedTopicMemoryApplication:
             **_admission_keyword(admission),
         )
         return result.model_copy(update={"embedding_calls": 1}), used_fallback
+
+    async def _excluded_topics(self) -> frozenset[str]:
+        """Return the Topic Memory artifacts that lost their evidence."""
+
+        exclusions = self._runtime._topic_memory_exclusions
+        if exclusions is None:
+            return frozenset()
+        return await exclusions(self.scope_id)
 
     async def get(self, request: GetTopicMemoryRequest, /) -> PublishedTopicMemory:
         if self._runtime._topic_memory_get is None:
@@ -3047,6 +3124,7 @@ class BuiltinRuntime:
         topic_memory_embedding_model: EmbeddingModel | None = None,
         topic_memory_processing_available: bool = False,
         topic_memory_search_observer: TopicMemorySearchObserver | None = None,
+        topic_memory_exclusions: TopicMemoryExclusions | None = None,
         external_skill_registry: ExternalSkillRegistryFactory | None = None,
         external_skill_importer: ExternalSkillImporter | None = None,
         skill_publication_service: SkillPublicationServiceFactory | None = None,
@@ -3068,6 +3146,7 @@ class BuiltinRuntime:
         dream_service: DreamService | None = None,
         generation_concurrency: int = 4,
         source_count_admissions: tuple[SourceCountAdmission, ...] = (),
+        source_lifecycle: SourceLifecycleServices | None = None,
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
@@ -3104,6 +3183,7 @@ class BuiltinRuntime:
         self._topic_memory_embedding_model = topic_memory_embedding_model
         self._topic_memory_processing_available = topic_memory_processing_available
         self._topic_memory_search_observer = topic_memory_search_observer
+        self._topic_memory_exclusions = topic_memory_exclusions
         self._external_skill_registry = external_skill_registry
         self._external_skill_importer = external_skill_importer
         self._skill_publication_service = skill_publication_service
@@ -3127,6 +3207,7 @@ class BuiltinRuntime:
         self.context_assembly_max_entries = context_assembly_max_entries
         self.recall_sufficiency_policy = recall_sufficiency_policy
         self._source_count_admissions = source_count_admissions
+        self._source_lifecycle = source_lifecycle
         self._scope_cache = ScopeCache(
             scope_cache_size,
             evictor=scope_evictor,
@@ -3153,6 +3234,7 @@ class BuiltinRuntime:
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
         self.records = RecordApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self, source_lifecycle)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
         self.skill = SkillApplication(self)

@@ -157,6 +157,7 @@ from powercontext.builtin.runtime.readiness import (
 from powercontext.builtin.runtime.recall_sufficiency import RecallSufficiencyPolicy
 from powercontext.builtin.runtime.relational import RelationalContexts
 from powercontext.builtin.runtime.source_count import SourceCountAdmission
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleServices
 from powercontext.builtin.runtime.topic_memory_processing import (
     TopicMemoryWorkerSpec,
     run_topic_memory_worker,
@@ -654,6 +655,11 @@ async def open_builtin_runtime(
                 scheduled_experience_runner=scheduled_experience_runner,
                 remote_ingestion=contexts,
                 source_count_admissions=_source_count_admissions(config, contexts, processing_bindings),
+                source_lifecycle=SourceLifecycleServices(
+                    database=contexts.database,
+                    repository=contexts.repositories.source_lifecycle,
+                ),
+                topic_memory_exclusions=contexts.withdrawn_topic_ids,
             )
         )
         runtime.artifact_processing_supervisor = await resources.enter_async_context(

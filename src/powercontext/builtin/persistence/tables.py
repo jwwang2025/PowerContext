@@ -1015,6 +1015,68 @@ MEMORY_ENTRY_HEADS_TABLE = Table(
 
 MEMORY_TABLES = (MEMORY_ENTRY_VERSIONS_TABLE, MEMORY_ENTRY_HEADS_TABLE)
 
+MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH = 128
+MAX_SOURCE_LIFECYCLE_KIND_LENGTH = 16
+MAX_SOURCE_LIFECYCLE_POLICY_LENGTH = 8
+MAX_SOURCE_LIFECYCLE_REASON_LENGTH = 512
+
+# One row per lifecycle node. ``ordinal`` records the registration order, which
+# is also the topological order of the dependency graph: a derived node may only
+# name parents that were registered before it.
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("ordinal", BigInteger, nullable=False),
+    Column("kind", identity_string(MAX_SOURCE_LIFECYCLE_KIND_LENGTH), nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("policy", identity_string(MAX_SOURCE_LIFECYCLE_POLICY_LENGTH), nullable=True),
+    Column("revision", Integer, nullable=True),
+    Column("source_type", identity_string(MAX_SOURCE_TYPE_LENGTH), nullable=True),
+    Column("source_id", identity_string(MAX_SOURCE_ID_LENGTH), nullable=True),
+    Column("memory_artifact_id", identity_string(MAX_ARTIFACT_ID_LENGTH), nullable=True),
+    Column("memory_revision", Integer, nullable=True),
+    Column("entry_id", identity_string(MAX_MEMORY_ENTRY_ID_LENGTH), nullable=True),
+    Column("entry_version_id", identity_string(MAX_MEMORY_ENTRY_ID_LENGTH), nullable=True),
+    Column("topic_artifact_id", identity_string(MAX_ARTIFACT_ID_LENGTH), nullable=True),
+    Column("topic_revision", Integer, nullable=True),
+    UniqueConstraint("scope_id", "ordinal", name="uq_pc_source_lifecycle_nodes_scope_ordinal"),
+    CheckConstraint("ordinal >= 0", name="ck_pc_source_lifecycle_nodes_ordinal_nonnegative"),
+    CheckConstraint(
+        "kind in ('source', 'memory', 'topic')",
+        name="ck_pc_source_lifecycle_nodes_kind",
+    ),
+)
+
+SOURCE_LIFECYCLE_PARENTS_TABLE = Table(
+    "pc_source_lifecycle_parents",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("ordinal", Integer, primary_key=True),
+    Column("parent_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), nullable=False),
+)
+
+SOURCE_LIFECYCLE_EVENTS_TABLE = Table(
+    "pc_source_lifecycle_events",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("sequence", Integer, primary_key=True),
+    Column("revision", Integer, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("reason", String(MAX_SOURCE_LIFECYCLE_REASON_LENGTH), nullable=False),
+    CheckConstraint("sequence > 0", name="ck_pc_source_lifecycle_events_sequence_positive"),
+    CheckConstraint("revision > 0", name="ck_pc_source_lifecycle_events_revision_positive"),
+)
+
+SOURCE_LIFECYCLE_TABLES = (
+    SOURCE_LIFECYCLE_NODES_TABLE,
+    SOURCE_LIFECYCLE_PARENTS_TABLE,
+    SOURCE_LIFECYCLE_EVENTS_TABLE,
+)
+
 TOPIC_MEMORY_TABLES = (
     TOPIC_MEMORY_RETRIEVAL_SHAPE_TABLE,
     TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE,
@@ -1185,6 +1247,7 @@ BUILTIN_TABLES = (
     + SHARED_TABLES
     + TOPIC_MEMORY_TABLES
     + MEMORY_TABLES
+    + SOURCE_LIFECYCLE_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
