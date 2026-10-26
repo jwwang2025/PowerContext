@@ -28,6 +28,11 @@ from powercontext.builtin.artifacts.memory.models import MemoryCitation, MemoryH
 from powercontext.builtin.artifacts.profile.models import Profile
 from powercontext.builtin.artifacts.topic_memory import TopicMemory, TopicMemorySearchHit
 from powercontext.builtin.runtime.errors import PreparedContextInvariantError
+from powercontext.builtin.runtime.evidence_selection import (
+    EvidenceDocument,
+    SelectedFragment,
+    select_evidence_fragments,
+)
 from powercontext.builtin.runtime.models import PrepareContextRequest, PreparedContext
 from powercontext.builtin.runtime.prepared_code import (
     CodeEvidenceRef,
@@ -106,6 +111,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +124,21 @@ class MemoryEntryAddress:
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One verbatim slice of a recalled Memory body.
+
+    The fragment is a literal slice: ``text`` is exactly the body characters
+    between ``start`` and ``end``, and ``address`` points at the exact entry
+    version the slice was taken from.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -228,6 +249,13 @@ class PreparedContextBuilder:
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
 
+        if request.evidence_selection:
+            return self._build_evidence_result(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
         if len(topic_memory_hits) > self.topic_memory_candidate_limit:
@@ -254,6 +282,64 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _build_evidence_result(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select literal evidence fragments for the query and render them.
+
+        The retrieval stage already decided which bodies are relevant. This
+        path decides which part of a body is worth the caller's byte budget,
+        and every delivered fragment stays a verbatim slice of the original
+        body with its exact citation and character range.
+        """
+
+        documents = tuple(
+            EvidenceDocument(
+                scope_id=candidates.scope_id,
+                memory_ref=hit.memory_ref,
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+                text=hit.text,
+            )
+            for candidates in memory_candidates
+            for hit in candidates.hits
+            if hit.text.strip()
+        )
+        selected = select_evidence_fragments(
+            query=request.query,
+            documents=documents,
+            max_bytes=request.max_bytes,
+            measure=_rendered_fragment_bytes,
+        )
+        fragments = tuple(
+            PreparedContextFragment(
+                address=MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=item.scope_id, artifact=item.memory_ref),
+                    entry_id=item.entry_id,
+                    entry_version_id=item.entry_version_id,
+                ),
+                start=item.start,
+                end=item.end,
+                text=item.text,
+            )
+            for item in selected
+        )
+        if not fragments:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = _render_fragments(fragments)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            raise PreparedContextInvariantError("output-budget")
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(fragment.address for fragment in fragments),
+            fragments=fragments,
         )
 
     def probe_budget(
@@ -692,6 +778,66 @@ def _render(entries: Sequence[_PreparedContextEntry]) -> str:
     }
     encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _fragment_item(
+    scope_id: str,
+    memory_ref: ArtifactRef,
+    entry_id: str,
+    entry_version_id: str,
+    content: str,
+    start: int,
+    end: int,
+) -> dict[str, object]:
+    return {
+        "citation": {
+            "scope_id": scope_id,
+            "memory_ref": memory_ref.model_dump(mode="json"),
+            "entry_id": entry_id,
+            "entry_version_id": entry_version_id,
+        },
+        "content": content,
+        "start": start,
+        "end": end,
+        "truncated": False,
+    }
+
+
+def _render_fragments(fragments: Sequence[PreparedContextFragment]) -> str:
+    items = [
+        _fragment_item(
+            fragment.address.memory.scope_id,
+            fragment.address.memory.artifact,
+            fragment.address.entry_id,
+            fragment.address.entry_version_id,
+            fragment.text,
+            fragment.start,
+            fragment.end,
+        )
+        for fragment in fragments
+    ]
+    envelope = {"trust": "untrusted_history", "items": items}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _rendered_fragment_bytes(fragments: Sequence[SelectedFragment]) -> int:
+    items = [
+        _fragment_item(
+            fragment.scope_id,
+            fragment.memory_ref,
+            fragment.entry_id,
+            fragment.entry_version_id,
+            fragment.text,
+            fragment.start,
+            fragment.end,
+        )
+        for fragment in fragments
+    ]
+    envelope = {"trust": "untrusted_history", "items": items}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    rendered = "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+    return len(rendered.encode("utf-8"))
 
 
 def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:
